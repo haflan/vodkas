@@ -26,19 +26,19 @@ are removed completely.
 `
 
 type SyncedStorage struct{
-        links map[string]string
+        links map[string][]byte
         sync.Mutex
 }
 
 var storage SyncedStorage
 
-func (storage *SyncedStorage) push(code string, contents string) {
+func (storage *SyncedStorage) push(code string, contents []byte) {
         storage.Lock()
         defer storage.Unlock()
         storage.links[code] = contents
 }
 
-func (storage *SyncedStorage) pop(code string) (contents string, found bool) {
+func (storage *SyncedStorage) pop(code string) (contents []byte, found bool) {
         storage.Lock()
         defer storage.Unlock()
         contents, found = storage.links[code]
@@ -53,7 +53,7 @@ func MainHandler(res http.ResponseWriter, r *http.Request) {
                 res.WriteHeader(http.StatusInternalServerError)
                 return
         }
-        storage.push("sorandom", string(b))
+        storage.push("sorandom", b)
         textOnly := r.Header.Get("Simple") != ""    // Should be able to force simple
         textOnly = textOnly || strings.Contains(r.Header.Get("User-Agent"), "curl")
         var responseText string
@@ -93,8 +93,7 @@ func ShotHandler(res http.ResponseWriter, r *http.Request) {
                         res.WriteHeader(http.StatusInternalServerError)
                         log.Panicln("Error when trying to read body")
                 }
-                contents = string(b)
-                storage.push(code, contents)
+                storage.push(code, b)
                 if _, err := res.Write([]byte(fmt.Sprint("Contents stored in given link\n"))); err != nil {
                         log.Panicln("Error when trying to write response")
                 }
@@ -105,7 +104,7 @@ func ShotHandler(res http.ResponseWriter, r *http.Request) {
 
 /**************** Main ****************/
 func main(){
-        storage.links = make(map[string]string)
+        storage.links = make(map[string][]byte)
         port := flag.Int("p", 8080, "Port")
         flag.Parse()
         defer fmt.Println("Server shutting down")
