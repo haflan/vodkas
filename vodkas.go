@@ -2,7 +2,8 @@
 package main
 
 import (
-        //"crypto/rand"
+        "crypto/rand"
+        "encoding/hex"
         "flag"
         "fmt"
         "github.com/gorilla/mux"
@@ -10,6 +11,7 @@ import (
         "go.etcd.io/bbolt"
         "io/ioutil"
         "log"
+        //"mime/multipart"
         "net/http"
         "strings"
         "time"
@@ -19,10 +21,10 @@ import (
 /**************** Handler Functions ****************/
 
 const InfoMessage = `Usage: 
-- POUR:     curl vetle.vodka[/<requested-shot-code>] -d <data>
-- SHOT:     curl vetle.vodka/<shot-code>
+- POUR:     curl vetle.vodka[/<requested-shot-key>] -d <data>
+- SHOT:     curl vetle.vodka/<shot-key>
 
-A shot code is an at-the-moment unique ID that's linked to the dumped data.
+A shot key is an at-the-moment unique ID that's linked to the dumped data.
 As soon as a specific shot has been accessed both the link and the contents 
 are removed completely.
 `
@@ -30,69 +32,92 @@ are removed completely.
 var rootBucket = "root"
 var db *bbolt.DB
 
-func push(code string, contents []byte) {
+// Pushes new data to database. Might be replaced by pour()
+func push(key string, contents []byte) {
         err := db.Update(func(tx *bbolt.Tx) error {
                 b := tx.Bucket([]byte(rootBucket))
                 if b == nil {
                       return errors.New("Failed to open root bucket")
                 }
-                err := b.Put([]byte(code), contents)
+                err := b.Put([]byte(key), contents)
                 return err
         })
         if err != nil {
-                log.Printf("Push to '%v' failed: %v", code, err)
+                log.Printf("Push to '%v' failed: %v", key, err)
         }
 }
-
-func pop(code string) (contents []byte, found bool) {
+// Pops data from database. Will probably be replaced by shot(), and support more
+// than a single download (although that will still be the default)
+func pop(key string) (contents []byte, found bool) {
         err := db.Update(func(tx *bbolt.Tx) error {
                 b := tx.Bucket([]byte(rootBucket))
                 if b == nil {
                         return errors.New("Failed to open root bucket")
                 }
-                contents = b.Get([]byte(code))
+                contents = b.Get([]byte(key))
                 found = contents != nil
                 if found {
-                        fmt.Printf("Found contents for shotcode %v\n", code)
-                        return b.Delete([]byte(code))
+                        fmt.Printf("Found contents for shotkey %v\n", key)
+                        return b.Delete([]byte(key))
                 }
                 return nil
         })
         if err != nil {
-                log.Printf("Push to '%v' failed: %v", code, err)
+                log.Printf("Push to '%v' failed: %v", key, err)
         }
         return
 }
 
-// TODO: Separate GETs and POSTs
-func MainHandler(res http.ResponseWriter, r *http.Request) {
-        b, err := ioutil.ReadAll(r.Body)
-        if err != nil {
-                res.WriteHeader(http.StatusInternalServerError)
-                return
-        }
-        push("sorandom", b)
-        textOnly := r.Header.Get("Simple") != ""    // Should be able to force simple
+func pour(key string, formdata []byte) {
+        fmt.Println(key)
+        fmt.Println(string(formdata))
+}
+
+func ShotHandler() {
+// TODO: Generate random key if no request given (https://flaviocopes.com/go-random/)
+        /*if !found {
+                res.WriteHeader(http.StatusNotFound)
+                if _, err := res.Write([]byte(fmt.Sprint("404 no shot here\n"))); err != nil {
+                        log.Panicln("Error when trying to write response")
+                }
+                return*/
+}
+
+
+func RootHandler(res http.ResponseWriter, r *http.Request) {
+        // Detect whether Simple mode (text only) is active
+        textOnly := r.Header.Get("Simple") != "" // for forcing textOnly mode
         textOnly = textOnly || strings.Contains(r.Header.Get("User-Agent"), "curl")
         var responseText string
-        if textOnly {
-                responseText = InfoMessage
-        } else {
-                responseText = "This will be replaced by a template"
+        if r.Method == http.MethodGet {
+                if textOnly {
+                        responseText = InfoMessage
+                } else {
+                        responseText = "This will be replaced by a template"
+                }
+        } else if r.Method == http.MethodPost {
+            b, err := ioutil.ReadAll(r.Body)
+            if err != nil {
+                    res.WriteHeader(http.StatusInternalServerError)
+                    return
+            }
+            // Generate random shot key
+            random := make([]byte, 16)
+            rand.Read(random)
+            randhex := hex.EncodeToString(random)
+            push(randhex, b)
+            if textOnly {
+                    responseText = r.Host + "/" + randhex
+            }
         }
-        if _, err = res.Write([]byte(responseText)); err != nil {
+        if _, err := res.Write([]byte(responseText)); err != nil {
                 log.Panicln("Error when trying to write response body")
         }
         return
 }
-
-// func PourHandler(res http.ResponseWriter, r *http.Request) {
-//}
-
-// TODO: Generate random code if no request given (https://flaviocopes.com/go-random/)
-func ShotHandler(res http.ResponseWriter, r *http.Request) {
-        code := mux.Vars(r)["shotCode"]
-        contents, found := pop(code)
+func KeyHandler(res http.ResponseWriter, r *http.Request) {
+        key := mux.Vars(r)["shotKey"]
+        contents, found := pop(key)
         // GET requests only
         /*if !found {
                 res.WriteHeader(http.StatusNotFound)
@@ -101,7 +126,7 @@ func ShotHandler(res http.ResponseWriter, r *http.Request) {
                 }
                 return*/
         if found {
-                // For POST requests to specific code, this should actually return 'link taken' or something
+                // For POST requests to specific key, this should actually return 'link taken' or something
                 if _, err := res.Write([]byte(contents)); err != nil {
                         log.Panicln("Error when trying to write response body")
                 }
@@ -111,7 +136,7 @@ func ShotHandler(res http.ResponseWriter, r *http.Request) {
                         res.WriteHeader(http.StatusInternalServerError)
                         log.Panicln("Error when trying to read body")
                 }
-                push(code, b)
+                push(key, b)
                 if _, err := res.Write([]byte(fmt.Sprint("Contents stored in given link\n"))); err != nil {
                         log.Panicln("Error when trying to write response")
                 }
@@ -145,8 +170,8 @@ func main(){
         defer fmt.Println("Server shutting down")
         fmt.Println("Server started listening at port", *port)
         router := mux.NewRouter()
-        router.HandleFunc("/", MainHandler)
-        router.HandleFunc("/{shotCode}", ShotHandler)
+        router.HandleFunc("/", RootHandler)
+        router.HandleFunc("/{shotKey}", KeyHandler)
         http.Handle("/", router)
 
         log.Fatal(http.ListenAndServe(fmt.Sprintf(":%v", *port), nil))
