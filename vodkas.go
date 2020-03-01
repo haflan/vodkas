@@ -9,16 +9,22 @@ import (
         "github.com/gorilla/mux"
         "github.com/pkg/errors"
         "go.etcd.io/bbolt"
+        "io"
         "io/ioutil"
         "log"
-        //"mime/multipart"
+        "mime/multipart"
         "net/http"
         "strings"
+        "strconv"
         "time"
 )
 
 
 /**************** Handler Functions ****************/
+
+const FormNameFile = "file"
+const FormNameText = "text"
+const FormNameNumShots = "numdls"
 
 const InfoMessage = `Usage: 
 - POUR:     curl vetle.vodka[/<requested-shot-key>] -d <data>
@@ -73,14 +79,35 @@ func pour(key string, formdata []byte) {
         fmt.Println(string(formdata))
 }
 
-func ShotHandler() {
-// TODO: Generate random key if no request given (https://flaviocopes.com/go-random/)
-        /*if !found {
-                res.WriteHeader(http.StatusNotFound)
-                if _, err := res.Write([]byte(fmt.Sprint("404 no shot here\n"))); err != nil {
-                        log.Panicln("Error when trying to write response")
-                }
-                return*/
+func extractMultipart(mr *multipart.Reader) (contents []byte, num int, err error) {
+    for {
+        var part *multipart.Part
+        part, err = mr.NextPart()
+        if err == io.EOF {
+            err = nil
+            break
+        }
+        formName := part.FormName()
+        if err != nil {
+            log.Fatal(err)
+        }
+        if formName == FormNameText || formName == FormNameFile {
+            contents, err = ioutil.ReadAll(part)
+            if err != nil {
+                return
+            }
+            continue
+        }
+        if formName == FormNameNumShots {
+            var numShotsRaw []byte
+            numShotsRaw, err = ioutil.ReadAll(part)
+            if err != nil { return }
+            num, err = strconv.Atoi(string(numShotsRaw))
+            if err != nil { return }
+        }
+    }
+    err = nil
+    return
 }
 
 
@@ -88,33 +115,52 @@ func RootHandler(res http.ResponseWriter, r *http.Request) {
         // Detect whether Simple mode (text only) is active
         textOnly := r.Header.Get("Simple") != "" // for forcing textOnly mode
         textOnly = textOnly || strings.Contains(r.Header.Get("User-Agent"), "curl")
-        var responseText string
+        var response string
         if r.Method == http.MethodGet {
                 if textOnly {
-                        responseText = InfoMessage
+                        response = InfoMessage
+                        if _, err := res.Write([]byte(response)); err != nil {
+                                log.Panicln("Error when trying to write response body")
+                        }
                 } else {
-                        responseText = "This will be replaced by a template"
+                        templateData := struct { ShotKey string }{ "" }
+                        uploadPageTemplate.Execute(res, templateData)
                 }
+                return
         } else if r.Method == http.MethodPost {
-            b, err := ioutil.ReadAll(r.Body)
+            var err error
+            var numshots int
+            var contents []byte
+            // Dumps can be both x-www-urlencoded and multipart/form-data. 
+            // Try multipart first, then x-www-urlencoded
+            mpReader, _ := r.MultipartReader()
+            if mpReader != nil {
+                contents, numshots, err = extractMultipart(mpReader)
+            } else {
+                numshots = 1
+                contents, err = ioutil.ReadAll(r.Body)
+            }
             if err != nil {
                     res.WriteHeader(http.StatusInternalServerError)
                     return
             }
+            fmt.Printf("Number of shots: %v\n", numshots)
+            fmt.Printf("Bytes in contents: %v\n", len(contents))
             // Generate random shot key
             random := make([]byte, 16)
             rand.Read(random)
             randhex := hex.EncodeToString(random)
-            push(randhex, b)
-            if textOnly {
-                    responseText = r.Host + "/" + randhex
+            push(randhex, contents)
+            if /*textOnly*/ true {
+                    response = r.Host + "/" + randhex
+                    if _, err := res.Write([]byte(response)); err != nil {
+                            log.Panicln("Error when trying to write response body")
+                    }
             }
+            return
         }
-        if _, err := res.Write([]byte(responseText)); err != nil {
-                log.Panicln("Error when trying to write response body")
-        }
-        return
 }
+
 func KeyHandler(res http.ResponseWriter, r *http.Request) {
         key := mux.Vars(r)["shotKey"]
         contents, found := pop(key)
