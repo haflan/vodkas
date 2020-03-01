@@ -26,32 +26,19 @@ const FormNameFile = "file"
 const FormNameText = "text"
 const FormNameNumShots = "numdls"
 
-const InfoMessage = `Usage: 
+var KeyTakenMessage = []byte("The requested key is taken. Try another.\n")
+var InfoMessage = []byte(`Usage:
 - POUR:     curl vetle.vodka[/<requested-shot-key>] -d <data>
 - SHOT:     curl vetle.vodka/<shot-key>
 
 A shot key is an at-the-moment unique ID that's linked to the dumped data.
 As soon as a specific shot has been accessed both the link and the contents 
 are removed completely.
-`
+`)
 
 var rootBucket = "root"
 var db *bbolt.DB
 
-// Pushes new data to database. Might be replaced by pour()
-func push(key string, contents []byte) {
-        err := db.Update(func(tx *bbolt.Tx) error {
-                b := tx.Bucket([]byte(rootBucket))
-                if b == nil {
-                      return errors.New("Failed to open root bucket")
-                }
-                err := b.Put([]byte(key), contents)
-                return err
-        })
-        if err != nil {
-                log.Printf("Push to '%v' failed: %v", key, err)
-        }
-}
 // Pops data from database. Will probably be replaced by shot(), and support more
 // than a single download (although that will still be the default)
 func pop(key string) (contents []byte, found bool) {
@@ -74,6 +61,25 @@ func pop(key string) (contents []byte, found bool) {
         return
 }
 
+// Check if the key is taken without touching the contents
+func smell(shotKey string) (found bool) {
+    _ = db.View(func(tx *bbolt.Tx) error {
+        b := tx.Bucket([]byte(rootBucket))
+        if b == nil {
+            log.Fatal("Failed to open root bucket")
+        }
+        found = b.Get([]byte(shotKey)) != nil
+        return nil
+    })
+    return
+}
+
+/*
+func shot(shotKey string) (contents []byte, error err) {
+
+}
+*/
+
 func pour(shotKey string, r *http.Request) (err error) {
         var contents []byte
         var numshots int
@@ -87,11 +93,17 @@ func pour(shotKey string, r *http.Request) (err error) {
             contents, err = ioutil.ReadAll(r.Body)
         }
         if err != nil {
-                return
+                return err
         }
         fmt.Printf("Number of shots: %v", numshots)
-        push(shotKey, contents)
-        return
+        err = db.Update(func(tx *bbolt.Tx) error {
+                b := tx.Bucket([]byte(rootBucket))
+                if b == nil {
+                      return errors.New("Failed to open root bucket")
+                }
+                return b.Put([]byte(shotKey), contents)
+        })
+        return err
 }
 
 func extractMultipart(mr *multipart.Reader) (contents []byte, num int, err error) {
@@ -125,16 +137,17 @@ func extractMultipart(mr *multipart.Reader) (contents []byte, num int, err error
     return
 }
 
+// TODO: Make function that handles responses based on mode?? like
+//              makeResponse(rw *http.ResponseWriter, textOnly bool, data, responseKey)
+//       where textOnly and responseKey maps to response messages or templates
 
 func RootHandler(res http.ResponseWriter, r *http.Request) {
         // Detect whether Simple mode (text only) is active
         textOnly := r.Header.Get("Simple") != "" // for forcing textOnly mode
         textOnly = textOnly || strings.Contains(r.Header.Get("User-Agent"), "curl")
-        var response string
         if r.Method == http.MethodGet {
                 if textOnly {
-                        response = InfoMessage
-                        if _, err := res.Write([]byte(response)); err != nil {
+                        if _, err := res.Write(InfoMessage); err != nil {
                                 log.Panicln("Error when trying to write response body")
                         }
                 } else {
@@ -148,10 +161,11 @@ func RootHandler(res http.ResponseWriter, r *http.Request) {
             shotKey := hex.EncodeToString(random)
             // Try to pour
             if err := pour(shotKey, r); err != nil {
+                log.Println(err)
                 res.WriteHeader(http.StatusInternalServerError)
             }
             if /*textOnly*/ true {
-                    response = r.Host + "/" + shotKey
+                    response := r.Host + "/" + shotKey
                     if _, err := res.Write([]byte(response)); err != nil {
                             log.Panicln("Error when trying to write response body")
                     }
@@ -161,8 +175,21 @@ func RootHandler(res http.ResponseWriter, r *http.Request) {
 
 func KeyHandler(res http.ResponseWriter, r *http.Request) {
         key := mux.Vars(r)["shotKey"]
+        textOnly := r.Header.Get("Simple") != "" // for forcing textOnly mode
+        textOnly = textOnly || strings.Contains(r.Header.Get("User-Agent"), "curl")
         if r.Method == http.MethodGet {
-
+            //contents, err := shot(key)
+        } else if r.Method == http.MethodPost {
+            if smell(key) {
+                // POSTs to taken  shouldn't happen often, so use textOnly always
+                if _, err := res.Write(KeyTakenMessage); err != nil {
+                    res.WriteHeader(http.StatusInternalServerError)
+                }
+            } else {
+                if err := pour(key, r); err != nil {
+                    res.WriteHeader(http.StatusInternalServerError)
+                }
+            }
         }
         contents, found := pop(key)
         // GET requests only
@@ -171,23 +198,18 @@ func KeyHandler(res http.ResponseWriter, r *http.Request) {
                 if _, err := res.Write([]byte(fmt.Sprint("404 no shot here\n"))); err != nil {
                         log.Panicln("Error when trying to write response")
                 }
-                return*/
+                return
         if found {
                 // For POST requests to specific key, this should actually return 'link taken' or something
                 if _, err := res.Write([]byte(contents)); err != nil {
                         log.Panicln("Error when trying to write response body")
                 }
         } else {
-                b, err := ioutil.ReadAll(r.Body)
-                if err != nil {
-                        res.WriteHeader(http.StatusInternalServerError)
-                        log.Panicln("Error when trying to read body")
-                }
-                push(key, b)
+                pour(key, r)
                 if _, err := res.Write([]byte(fmt.Sprint("Contents stored in given link\n"))); err != nil {
                         log.Panicln("Error when trying to write response")
                 }
-        }
+        }*/
         fmt.Printf("Request from client: %v\n", r.Header.Get("User-Agent"))
         return
 }
