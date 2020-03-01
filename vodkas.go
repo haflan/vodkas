@@ -74,9 +74,24 @@ func pop(key string) (contents []byte, found bool) {
         return
 }
 
-func pour(key string, formdata []byte) {
-        fmt.Println(key)
-        fmt.Println(string(formdata))
+func pour(shotKey string, r *http.Request) (err error) {
+        var contents []byte
+        var numshots int
+        // Dumps can be both x-www-urlencoded and multipart/form-data.
+        // Try multipart first, then x-www-urlencoded if no mpReader is returned
+        mpReader, _ := r.MultipartReader()
+        if mpReader != nil {
+            contents, numshots, err = extractMultipart(mpReader)
+        } else {
+            numshots = 1
+            contents, err = ioutil.ReadAll(r.Body)
+        }
+        if err != nil {
+                return
+        }
+        fmt.Printf("Number of shots: %v", numshots)
+        push(shotKey, contents)
+        return
 }
 
 func extractMultipart(mr *multipart.Reader) (contents []byte, num int, err error) {
@@ -126,43 +141,29 @@ func RootHandler(res http.ResponseWriter, r *http.Request) {
                         templateData := struct { ShotKey string }{ "" }
                         uploadPageTemplate.Execute(res, templateData)
                 }
-                return
         } else if r.Method == http.MethodPost {
-            var err error
-            var numshots int
-            var contents []byte
-            // Dumps can be both x-www-urlencoded and multipart/form-data. 
-            // Try multipart first, then x-www-urlencoded
-            mpReader, _ := r.MultipartReader()
-            if mpReader != nil {
-                contents, numshots, err = extractMultipart(mpReader)
-            } else {
-                numshots = 1
-                contents, err = ioutil.ReadAll(r.Body)
-            }
-            if err != nil {
-                    res.WriteHeader(http.StatusInternalServerError)
-                    return
-            }
-            fmt.Printf("Number of shots: %v\n", numshots)
-            fmt.Printf("Bytes in contents: %v\n", len(contents))
             // Generate random shot key
             random := make([]byte, 16)
             rand.Read(random)
-            randhex := hex.EncodeToString(random)
-            push(randhex, contents)
+            shotKey := hex.EncodeToString(random)
+            // Try to pour
+            if err := pour(shotKey, r); err != nil {
+                res.WriteHeader(http.StatusInternalServerError)
+            }
             if /*textOnly*/ true {
-                    response = r.Host + "/" + randhex
+                    response = r.Host + "/" + shotKey
                     if _, err := res.Write([]byte(response)); err != nil {
                             log.Panicln("Error when trying to write response body")
                     }
             }
-            return
         }
 }
 
 func KeyHandler(res http.ResponseWriter, r *http.Request) {
         key := mux.Vars(r)["shotKey"]
+        if r.Method == http.MethodGet {
+
+        }
         contents, found := pop(key)
         // GET requests only
         /*if !found {
@@ -191,10 +192,33 @@ func KeyHandler(res http.ResponseWriter, r *http.Request) {
         return
 }
 
+// Prints all keys in the database along with size of the contents
+func statDB() {
+    err := db.View(func(tx *bbolt.Tx) error {
+        root := tx.Bucket([]byte(rootBucket))
+        if root == nil {
+            return errors.New("Failed to open root bucket")
+        }
+        number := 0
+        fmt.Println("Elements in database:")
+        err := root.ForEach(func (k, v []byte) error {
+            fmt.Printf("%v %v\n", string(k), len(v))
+            number++
+            return nil
+        })
+        fmt.Printf("\n%v elements \n", number)
+        return err
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+}
+
 /**************** Main ****************/
 func main(){
         port := flag.Int("p", 8080, "Port")
         dbFile := flag.String("d", "vodka.db", "Database file")
+        stat := flag.Bool("s", false, "View database keys and size of associated contents")
         flag.Parse()
         var err error // Because ':=' can't be used on the line below without declaring db as a new *local* variable, making the global one nil
         db, err = bbolt.Open(*dbFile, 0600, &bbolt.Options{Timeout: 1 * time.Second})
@@ -212,8 +236,11 @@ func main(){
         if err != nil {
                 panic(err)
         }
+        if *stat {
+            statDB()
+            return
+        }
 
-        defer fmt.Println("Server shutting down")
         fmt.Println("Server started listening at port", *port)
         router := mux.NewRouter()
         router.HandleFunc("/", RootHandler)
