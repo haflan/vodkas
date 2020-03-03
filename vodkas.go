@@ -40,23 +40,20 @@ var db *bbolt.DB
 
 // Pops data from database. Will probably be replaced by shot(), and support more
 // than a single download (although that will still be the default)
-func pop(key string) (contents []byte, found bool) {
-	err := db.Update(func(tx *bbolt.Tx) error {
+func pop(key string) (contents []byte, err error) {
+	err = db.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket([]byte(rootBucket))
 		if b == nil {
 			return errors.New("Failed to open root bucket")
 		}
 		contents = b.Get([]byte(key))
-		found = contents != nil
-		if found {
+		if contents != nil {
 			fmt.Printf("Found contents for shotkey %v\n", key)
 			return b.Delete([]byte(key))
+		} else {
+			return nil
 		}
-		return nil
 	})
-	if err != nil {
-		log.Printf("Push to '%v' failed: %v", key, err)
-	}
 	return
 }
 
@@ -73,11 +70,10 @@ func smell(shotKey string) (found bool) {
 	return
 }
 
-/*
-func shot(shotKey string) (contents []byte, error err) {
-
+func shot(shotKey string) (contents []byte, err error) {
+	contents, err = pop(shotKey)
+	return
 }
-*/
 
 func pour(shotKey string, r *http.Request) (err error) {
 	var contents []byte
@@ -140,6 +136,20 @@ func extractMultipart(mr *multipart.Reader) (contents []byte, num int, err error
 	return
 }
 
+// TODO: Extract post page too
+func writeUploadPage(res http.ResponseWriter, textOnly bool, shotKey string) (err error) {
+	if textOnly {
+		_, err = res.Write(InfoMessage)
+	} else {
+		templateData := struct{ ShotKey string }{shotKey}
+		err = uploadPageTemplate.Execute(res, templateData)
+	}
+	if err != nil {
+		res.WriteHeader(http.StatusInternalServerError)
+	}
+	return
+}
+
 // TODO: Make function that handles responses based on mode?? like
 //              makeResponse(rw *http.ResponseWriter, textOnly bool, data, responseKey)
 //       where textOnly and responseKey maps to response messages or templates
@@ -149,14 +159,7 @@ func RootHandler(res http.ResponseWriter, r *http.Request) {
 	textOnly := r.Header.Get("Simple") != "" // for forcing textOnly mode
 	textOnly = textOnly || strings.Contains(r.Header.Get("User-Agent"), "curl")
 	if r.Method == http.MethodGet {
-		if textOnly {
-			if _, err := res.Write(InfoMessage); err != nil {
-				log.Panicln("Error when trying to write response body")
-			}
-		} else {
-			templateData := struct{ ShotKey string }{""}
-			uploadPageTemplate.Execute(res, templateData)
-		}
+		writeUploadPage(res, textOnly, "")
 	} else if r.Method == http.MethodPost {
 		// Generate random shot key
 		random := make([]byte, 16)
@@ -181,7 +184,18 @@ func KeyHandler(res http.ResponseWriter, r *http.Request) {
 	textOnly := r.Header.Get("Simple") != "" // for forcing textOnly mode
 	textOnly = textOnly || strings.Contains(r.Header.Get("User-Agent"), "curl")
 	if r.Method == http.MethodGet {
-		//contents, err := shot(key)
+		contents, err := shot(key)
+		if err != nil {
+			log.Panicln("Error when trying to read contents")
+			res.WriteHeader(http.StatusInternalServerError)
+		}
+		if contents == nil {
+			writeUploadPage(res, textOnly, key)
+		}
+		if _, err := res.Write(contents); err != nil {
+			log.Panicln("Error when trying to write response")
+			res.WriteHeader(http.StatusInternalServerError)
+		}
 	} else if r.Method == http.MethodPost {
 		if smell(key) {
 			// POSTs to taken  shouldn't happen often, so use textOnly always
@@ -194,7 +208,6 @@ func KeyHandler(res http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	contents, found := pop(key)
 	// GET requests only
 	/*if !found {
 	          res.WriteHeader(http.StatusNotFound)
