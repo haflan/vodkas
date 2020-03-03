@@ -26,6 +26,7 @@ const FormNameText = "text"
 const FormNameNumShots = "numdls"
 
 var KeyTakenMessage = []byte("The requested key is taken. Try another.\n")
+// TODO: Might want to update this with info about vv.sh instead?
 var InfoMessage = []byte(`Usage:
 - POUR:     curl vetle.vodka[/<requested-shot-key>] -d <data>
 - SHOT:     curl vetle.vodka/<shot-key>
