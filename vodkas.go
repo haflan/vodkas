@@ -6,9 +6,6 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
-	"github.com/gorilla/mux"
-	"github.com/pkg/errors"
-	"go.etcd.io/bbolt"
 	"io"
 	"io/ioutil"
 	"log"
@@ -16,7 +13,12 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/gorilla/mux"
+	"github.com/pkg/errors"
+	"go.etcd.io/bbolt"
 )
 
 /**************** Handler Functions ****************/
@@ -26,6 +28,7 @@ const FormNameText = "text"
 const FormNameNumShots = "numdls"
 
 var KeyTakenMessage = []byte("The requested key is taken. Try another.\n")
+
 // TODO: Might want to update this with info about vv.sh instead?
 var InfoMessage = []byte(`Usage:
 - POUR:     curl vetle.vodka[/<requested-shot-key>] -d <data>
@@ -36,12 +39,19 @@ As soon as a specific shot has been accessed both the link and the contents
 are removed completely.
 `)
 
-var rootBucket = "root"
 var db *bbolt.DB
+var rootBucket = "root"
+var storageCTRL struct {
+	bytesMax  int
+	bytesUsed int
+	sync.Mutex
+}
 
 // Pops data from database. Will probably be replaced by shot(), and support more
 // than a single download (although that will still be the default)
 func pop(key string) (contents []byte, err error) {
+	storageCTRL.Lock()
+	defer storageCTRL.Unlock()
 	err = db.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket([]byte(rootBucket))
 		if b == nil {
@@ -51,10 +61,12 @@ func pop(key string) (contents []byte, err error) {
 		if contents != nil {
 			fmt.Printf("Found contents for shotkey %v\n", key)
 			return b.Delete([]byte(key))
-		} else {
-			return nil
 		}
+		return nil
 	})
+	if err == nil {
+		storageCTRL.bytesUsed -= len(contents)
+	}
 	return
 }
 
@@ -77,6 +89,8 @@ func shot(shotKey string) (contents []byte, err error) {
 }
 
 func pour(shotKey string, r *http.Request) (err error) {
+	storageCTRL.Lock()
+	defer storageCTRL.Unlock()
 	var contents []byte
 	var numshots int
 	// Dumps can be both x-www-urlencoded and multipart/form-data.
@@ -91,6 +105,9 @@ func pour(shotKey string, r *http.Request) (err error) {
 	if err != nil {
 		return err
 	}
+	if storageCTRL.bytesUsed+len(contents) > storageCTRL.bytesMax {
+		return errors.New("Database is full")
+	}
 	fmt.Printf("Number of shots: %v", numshots)
 	err = db.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket([]byte(rootBucket))
@@ -99,6 +116,9 @@ func pour(shotKey string, r *http.Request) (err error) {
 		}
 		return b.Put([]byte(shotKey), contents)
 	})
+	if err == nil {
+		storageCTRL.bytesUsed += len(contents)
+	}
 	return err
 }
 
@@ -170,7 +190,11 @@ func RootHandler(res http.ResponseWriter, r *http.Request) {
 		if err := pour(shotKey, r); err != nil {
 			log.Println(err)
 			res.WriteHeader(http.StatusInternalServerError)
+			// TODO: Error based on err
+			res.Write([]byte("An error occurred"))
+			return
 		}
+		// TODO: Error template. The current handling is the opposite of helpful
 		if /*textOnly*/ true {
 			response := r.Host + "/" + shotKey
 			if _, err := res.Write([]byte(response)); err != nil {
@@ -187,7 +211,7 @@ func KeyHandler(res http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
 		contents, err := shot(key)
 		if err != nil {
-			log.Panicln("Error when trying to read contents")
+			log.Panicln(err)
 			res.WriteHeader(http.StatusInternalServerError)
 		}
 		if contents == nil {
@@ -199,7 +223,7 @@ func KeyHandler(res http.ResponseWriter, r *http.Request) {
 		}
 	} else if r.Method == http.MethodPost {
 		if smell(key) {
-			// POSTs to taken  shouldn't happen often, so use textOnly always
+			// POSTs from website to taken shouldn't happen, so use textOnly always
 			if _, err := res.Write(KeyTakenMessage); err != nil {
 				res.WriteHeader(http.StatusInternalServerError)
 			}
@@ -231,26 +255,59 @@ func KeyHandler(res http.ResponseWriter, r *http.Request) {
 	return
 }
 
-// Prints all keys in the database along with size of the contents
-func statDB() {
+// Returns summary of the database in the form of 'number of elements, numBytes, err'
+// If 'speak' is true, all keys and the size of their corresponding data are printed
+func statDB(speak bool) (int, int, error) {
+	var numElements, numBytes int
 	err := db.View(func(tx *bbolt.Tx) error {
 		root := tx.Bucket([]byte(rootBucket))
 		if root == nil {
 			return errors.New("Failed to open root bucket")
 		}
-		number := 0
-		fmt.Println("Elements in database:")
+		// Not sure if bocket.Stats().LeafInUse equals the actual number of bytes
+		// in use, but I think it should be approximately the same
+		if !speak {
+			numElements = root.Stats().KeyN
+			numBytes = root.Stats().LeafInuse
+			return nil
+		}
+		// For 'speak', the bucket must be iterated through anyway, so might as well
+		// count the number of elements and bytes manually
 		err := root.ForEach(func(k, v []byte) error {
 			fmt.Printf("%v %v\n", string(k), len(v))
-			number++
+			numElements++
+			numBytes += len(v)
 			return nil
 		})
-		fmt.Printf("\n%v elements \n", number)
+		return err
+	})
+	return numElements, numBytes, err
+}
+
+// *init* is a special function, hence the name of this one
+// https://tutorialedge.net/golang/the-go-init-function/
+func initialize(dbFile string, limit int, port int) error {
+	var err error // Because ':=' can't be used on the line below without declaring db as a new *local* variable, making the global one nil
+	db, err = bbolt.Open(dbFile, 0600, &bbolt.Options{Timeout: 1 * time.Second})
+	if err != nil {
+		return err
+	}
+	err = db.Update(func(tx *bbolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists([]byte(rootBucket))
 		return err
 	})
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
+	_, numBytes, err := statDB(false)
+	if err != nil {
+		return err
+	}
+	storageCTRL.bytesMax = 1000 * limit
+	storageCTRL.bytesUsed = numBytes
+	fmt.Printf("%v / %v KBs used\n", numBytes/1000, limit)
+	fmt.Println("Server started listening at port", port)
+	return nil
 }
 
 /**************** Main ****************/
@@ -258,29 +315,23 @@ func main() {
 	port := flag.Int("p", 8080, "Port")
 	dbFile := flag.String("d", "vodka.db", "Database file")
 	stat := flag.Bool("s", false, "View database keys and size of associated contents")
+	limit := flag.Int("l", 10000, "Storage limit in kilobytes (1000 bytes)")
 	flag.Parse()
-	var err error // Because ':=' can't be used on the line below without declaring db as a new *local* variable, making the global one nil
-	db, err = bbolt.Open(*dbFile, 0600, &bbolt.Options{Timeout: 1 * time.Second})
+	err := initialize(*dbFile, *limit, *port)
 	defer db.Close()
 	if err != nil {
-		panic(err)
-	}
-	err = db.Update(func(tx *bbolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists([]byte(rootBucket))
-		if err != nil {
-			return err
-		}
-		return err
-	})
-	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 	if *stat {
-		statDB()
+		fmt.Println("Elements in database:")
+		numElements, numBytes, err := statDB(true)
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("\n%v elements in database\n", numElements)
+		fmt.Printf("\n%v bytes used\n", numBytes)
 		return
 	}
-
-	fmt.Println("Server started listening at port", *port)
 	router := mux.NewRouter()
 	router.HandleFunc("/", RootHandler)
 	router.HandleFunc("/{shotKey}", KeyHandler)
