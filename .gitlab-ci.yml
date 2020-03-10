@@ -1,0 +1,6 @@
+build_image:
+  script:
+    - docker build -t d.haflan.dev/general/vodkas:latest .
+    - docker push d.haflan.dev/general/vodkas
+  only:
+    - master
