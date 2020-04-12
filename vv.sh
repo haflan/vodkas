@@ -1,6 +1,6 @@
 #!/bin/bash
 
-HOST=100.115.92.201:8080
+HOST=https://vetle.vodka
 CMD="$1"
 
 function help () {
