@@ -1,0 +1,60 @@
+*s*: curl / Simple (raw text instructions)
+*w*: web  (template)
+
+RootHandler:
+    GET:
+        s: instructions on how to use the server (with curl)
+        w: upload page
+    POST: 
+        - Generate a random (unguessable) shot key.
+        - Pour()
+        - Return success or error page based on result
+
+
+
+
+KeyHandler (/{shotKey}:
+    GET:
+        If exists: 
+            Return data directly from DB and increase numdls.
+            Delete if limit is reached.
+        If not:
+            s: 404 or "this key is available"
+            w: upload page with post destination as /{shotKey}
+
+    POST:
+        If already exists:
+            s: return a 'unavailable key' info message
+            w: 'unavailable key' error page
+        Otherwise: Pour()
+            Process the form data, just like in RootHandler, but use the
+            requested key instead of a random one. Return success page
+
+    DELETE: MAYBE LATER (must generate a delete code etc)
+         
+Pour()
+    - multipart form data with 
+      * text OR file
+      * numdls: number of dls before delete (0 for inf?, 1 default)
+      * LATER: expiration (unix milli time? or parse on server?)
+      * LATER: password
+    - Reads the Content-Disposition of text or file data and 
+      stores the contents in db along with some metadata
+    
+Three bbolt buckets:
+- data
+- numdls
+- limitdls
+
+or use nested buckets, so that key maps to a bucket that contains keys:
+ data
+ limitdls
+ numdls
+
+I think the latter is more optimal
+
+
+
+=== for curl client:
+
+add functionality for posting links (just wrap the link in a meta tag)
