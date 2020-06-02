@@ -10,4 +10,4 @@ FROM alpine:latest
 WORKDIR /root/
 COPY --from=0 /app/vodkas .
 EXPOSE 8080
-CMD ["/root/vodkas"]
+CMD ["sh", "-c", "/root/vodkas -a $VADMINKEY -l $VSTORAGE"]
