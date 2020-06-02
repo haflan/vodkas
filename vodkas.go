@@ -24,9 +24,13 @@ import (
 
 /**************** Handler Functions ****************/
 
-const FormNameFile = "file"
-const FormNameText = "text"
-const FormNameNumShots = "numdls"
+const (
+	Version          = "1.0"
+	FormNameFile     = "file"
+	FormNameText     = "text"
+	FormNameNumShots = "numdls"
+	AdminKeyHeader   = "Admin-Key"
+)
 
 var (
 	keyTakenMessage    = []byte("The requested key is taken. Try another.\n")
@@ -99,6 +103,10 @@ func shot(shotKey string) (contents []byte, err error) {
 			}
 			return datab.Delete(bShotKey)
 		}
+		// bnums must be 'remade' to avoid segmentation fault when going from eg. 0 to -1
+		// I guess because the buffer used to store 0 is too small for -1 (2's complement?).
+		// Size of the buffer is returned by binary.Varint btw, so this is easy to check.
+		bnums = make([]byte, binary.MaxVarintLen64)
 		binary.PutVarint(bnums, nums)
 		numsb.Put(bShotKey, bnums)
 		return nil
@@ -112,8 +120,7 @@ func shot(shotKey string) (contents []byte, err error) {
 // fixNumShots checks that numshots is valid, i.e. between 1 and max
 // (unless an admin header is given), otherwise adjusts to legal values
 func legalNumshots(numshots int, r *http.Request) int {
-	xAdminKey := r.Header.Get("X-ADMIN-KEY")
-	if xAdminKey == adminKey {
+	if r.Header.Get(AdminKeyHeader) == adminKey {
 		return numshots
 	}
 	if numshots < 1 {
@@ -146,7 +153,7 @@ func pour(shotKey string, r *http.Request) (err error) {
 	if storageCTRL.bytesUsed+len(contents) > storageCTRL.bytesMax {
 		return errors.New("database is full")
 	}
-	fmt.Printf("Number of shots: %v", numshots)
+	fmt.Printf("Number of shots: %v\n", numshots)
 	err = db.Update(func(tx *bbolt.Tx) error {
 		datab := tx.Bucket([]byte(dataBucketKey))
 		numsb := tx.Bucket([]byte(numsBucketKey))
@@ -254,6 +261,7 @@ func keyHandler(res http.ResponseWriter, r *http.Request) {
 	key := mux.Vars(r)["shotKey"]
 	textOnly := r.Header.Get("Simple") != "" // for forcing textOnly mode
 	textOnly = textOnly || strings.Contains(r.Header.Get("User-Agent"), "curl")
+	var err error
 	if r.Method == http.MethodGet {
 		// Return upload page if the key is available
 		if !smell(key) {
@@ -267,26 +275,35 @@ func keyHandler(res http.ResponseWriter, r *http.Request) {
 			res.Write(keyTakenMessage)
 			res.WriteHeader(http.StatusInternalServerError)
 		}
-		if _, err := res.Write(contents); err != nil {
+		if _, err = res.Write(contents); err != nil {
 			log.Panicln("Error when trying to write response")
 			res.WriteHeader(http.StatusInternalServerError)
 		}
 	} else if r.Method == http.MethodPost {
+		// Admin should be able to overwrite anything
+		if r.Header.Get(AdminKeyHeader) == adminKey {
+			if err = pour(key, r); err != nil {
+				goto commonerror
+			}
+			return
+		}
 		if smell(key) {
 			// POSTs from website to taken shouldn't happen, so use textOnly always
-			if _, err := res.Write(keyTakenMessage); err != nil {
+			if _, err = res.Write(keyTakenMessage); err != nil {
 				res.WriteHeader(http.StatusInternalServerError)
 			}
 		} else {
-			// TODO: Notify if database is full, not just server error
-			if err := pour(key, r); err != nil {
-				log.Println(err)
-				res.Write(serverErrorMessage)
-				res.WriteHeader(http.StatusInternalServerError)
-				return
+			if err = pour(key, r); err != nil {
+				goto commonerror
 			}
 			res.Write(pourSuccessMessage)
 		}
+		return
+	commonerror:
+		// TODO: Notify if database is full, not just server error for everything
+		res.WriteHeader(http.StatusInternalServerError)
+		res.Write(serverErrorMessage)
+		log.Println(err)
 	}
 	//fmt.Printf("Request from client: %v\n", r.Header.Get("User-Agent"))
 	return
@@ -353,12 +370,17 @@ func initialize(dbFile string, limitStorage, limitNums, port int, admKey string)
 /**************** Main ****************/
 func main() {
 	port := flag.Int("p", 8080, "Port")
+	version := flag.Bool("v", false, "Print version and exit")
 	dbFile := flag.String("d", "vodka.db", "Database file")
 	stat := flag.Bool("s", false, "View database keys and size of associated contents")
 	storageLimit := flag.Int("l", 10000, "Storage limit in kilobytes (1000 bytes)")
 	numsLimit := flag.Int("n", 10, "Maximum number of shots per key")
 	admKey := flag.String("a", "vodkas", "Admin key to allow unlimited shots")
 	flag.Parse()
+	if *version {
+		fmt.Println("vodkas " + Version)
+		return
+	}
 	err := initialize(*dbFile, *storageLimit, *numsLimit, *port, *admKey)
 	defer db.Close()
 	if err != nil {
