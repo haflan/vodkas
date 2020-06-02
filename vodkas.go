@@ -3,6 +3,7 @@ package main
 
 import (
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -27,7 +28,11 @@ const FormNameFile = "file"
 const FormNameText = "text"
 const FormNameNumShots = "numdls"
 
-var KeyTakenMessage = []byte("The requested key is taken. Try another.\n")
+var (
+	keyTakenMessage    = []byte("The requested key is taken. Try another.\n")
+	serverErrorMessage = []byte("Internal server error!")
+	pourSuccessMessage = []byte("Successfully submitted data")
+)
 
 // TODO: Might want to update this with info about vv.sh instead?
 var InfoMessage = []byte(`Usage:
@@ -40,28 +45,62 @@ are removed completely.
 `)
 
 var db *bbolt.DB
-var rootBucket = "root"
+var dataBucketKey = "data"
+var numsBucketKey = "nums"
+var shotNumsLimit int
+var adminKey string
 var storageCTRL struct {
 	bytesMax  int
 	bytesUsed int
 	sync.Mutex
 }
 
-// Pops data from database. Will probably be replaced by shot(), and support more
-// than a single download (although that will still be the default)
-func pop(key string) (contents []byte, err error) {
+// Check if the key is taken without touching the contents
+func smell(shotKey string) (found bool) {
+	_ = db.View(func(tx *bbolt.Tx) error {
+		nb := tx.Bucket([]byte(numsBucketKey))
+		if nb == nil {
+			log.Fatal("Failed to open essential bucket")
+		}
+		found = nb.Get([]byte(shotKey)) != nil
+		return nil
+	})
+	return
+}
+
+// take a shot, i.e. load the contents and decrement the nums
+func shot(shotKey string) (contents []byte, err error) {
 	storageCTRL.Lock()
 	defer storageCTRL.Unlock()
 	err = db.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket([]byte(rootBucket))
-		if b == nil {
-			return errors.New("Failed to open root bucket")
+		bShotKey := []byte(shotKey)
+		datab := tx.Bucket([]byte(dataBucketKey))
+		numsb := tx.Bucket([]byte(numsBucketKey))
+		if datab == nil || numsb == nil {
+			log.Fatal("Failed to open essential bucket")
 		}
-		contents = b.Get([]byte(key))
-		if contents != nil {
-			fmt.Printf("Found contents for shotkey %v\n", key)
-			return b.Delete([]byte(key))
+		// Find if key exists and, in that case, find number of shots left
+		bnums := numsb.Get(bShotKey)
+		if bnums == nil {
+			return errors.New("no shots available for key " + shotKey)
 		}
+		nums, _ := binary.Varint(bnums)
+		nums--
+		log.Printf("Found contents for key '%v'. Shots left: %v", shotKey, nums)
+		// Get contents
+		contents = datab.Get(bShotKey)
+		if contents == nil {
+			log.Fatal("a key was found in the nums bucket but not the data bucket")
+		}
+		// Delete nums and data if this was the last shot. Otherwise decrement nums
+		if nums == 0 {
+			if err = numsb.Delete(bShotKey); err != nil {
+				return err
+			}
+			return datab.Delete(bShotKey)
+		}
+		binary.PutVarint(bnums, nums)
+		numsb.Put(bShotKey, bnums)
 		return nil
 	})
 	if err == nil {
@@ -70,22 +109,20 @@ func pop(key string) (contents []byte, err error) {
 	return
 }
 
-// Check if the key is taken without touching the contents
-func smell(shotKey string) (found bool) {
-	_ = db.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket([]byte(rootBucket))
-		if b == nil {
-			log.Fatal("Failed to open root bucket")
-		}
-		found = b.Get([]byte(shotKey)) != nil
-		return nil
-	})
-	return
-}
-
-func shot(shotKey string) (contents []byte, err error) {
-	contents, err = pop(shotKey)
-	return
+// fixNumShots checks that numshots is valid, i.e. between 1 and max
+// (unless an admin header is given), otherwise adjusts to legal values
+func legalNumshots(numshots int, r *http.Request) int {
+	xAdminKey := r.Header.Get("X-ADMIN-KEY")
+	if xAdminKey == adminKey {
+		return numshots
+	}
+	if numshots < 1 {
+		return 1
+	}
+	if numshots > shotNumsLimit {
+		return shotNumsLimit
+	}
+	return numshots
 }
 
 func pour(shotKey string, r *http.Request) (err error) {
@@ -102,19 +139,28 @@ func pour(shotKey string, r *http.Request) (err error) {
 		numshots = 1
 		contents, err = ioutil.ReadAll(r.Body)
 	}
+	numshots = legalNumshots(numshots, r)
 	if err != nil {
 		return err
 	}
 	if storageCTRL.bytesUsed+len(contents) > storageCTRL.bytesMax {
-		return errors.New("Database is full")
+		return errors.New("database is full")
 	}
 	fmt.Printf("Number of shots: %v", numshots)
 	err = db.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket([]byte(rootBucket))
-		if b == nil {
-			return errors.New("Failed to open root bucket")
+		datab := tx.Bucket([]byte(dataBucketKey))
+		numsb := tx.Bucket([]byte(numsBucketKey))
+		if datab == nil || numsb == nil {
+			log.Fatal("failed to open essential bucket")
 		}
-		return b.Put([]byte(shotKey), contents)
+		// Put number of shots
+		bnums64 := make([]byte, binary.MaxVarintLen64)
+		binary.PutVarint(bnums64, int64(numshots))
+		err = numsb.Put([]byte(shotKey), bnums64)
+		if err != nil {
+			return err
+		}
+		return datab.Put([]byte(shotKey), contents)
 	})
 	if err == nil {
 		storageCTRL.bytesUsed += len(contents)
@@ -175,7 +221,7 @@ func writeUploadPage(res http.ResponseWriter, textOnly bool, shotKey string) (er
 //              makeResponse(rw *http.ResponseWriter, textOnly bool, data, responseKey)
 //       where textOnly and responseKey maps to response messages or templates
 
-func RootHandler(res http.ResponseWriter, r *http.Request) {
+func rootHandler(res http.ResponseWriter, r *http.Request) {
 	// Detect whether Simple mode (text only) is active
 	textOnly := r.Header.Get("Simple") != "" // for forcing textOnly mode
 	textOnly = textOnly || strings.Contains(r.Header.Get("User-Agent"), "curl")
@@ -204,18 +250,22 @@ func RootHandler(res http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func KeyHandler(res http.ResponseWriter, r *http.Request) {
+func keyHandler(res http.ResponseWriter, r *http.Request) {
 	key := mux.Vars(r)["shotKey"]
 	textOnly := r.Header.Get("Simple") != "" // for forcing textOnly mode
 	textOnly = textOnly || strings.Contains(r.Header.Get("User-Agent"), "curl")
 	if r.Method == http.MethodGet {
+		// Return upload page if the key is available
+		if !smell(key) {
+			writeUploadPage(res, textOnly, key)
+			return
+		}
+		// Otherwise return contents
 		contents, err := shot(key)
 		if err != nil {
-			log.Panicln(err)
+			log.Println(err)
+			res.Write(keyTakenMessage)
 			res.WriteHeader(http.StatusInternalServerError)
-		}
-		if contents == nil {
-			writeUploadPage(res, textOnly, key)
 		}
 		if _, err := res.Write(contents); err != nil {
 			log.Panicln("Error when trying to write response")
@@ -224,34 +274,21 @@ func KeyHandler(res http.ResponseWriter, r *http.Request) {
 	} else if r.Method == http.MethodPost {
 		if smell(key) {
 			// POSTs from website to taken shouldn't happen, so use textOnly always
-			if _, err := res.Write(KeyTakenMessage); err != nil {
+			if _, err := res.Write(keyTakenMessage); err != nil {
 				res.WriteHeader(http.StatusInternalServerError)
 			}
 		} else {
+			// TODO: Notify if database is full, not just server error
 			if err := pour(key, r); err != nil {
+				log.Println(err)
+				res.Write(serverErrorMessage)
 				res.WriteHeader(http.StatusInternalServerError)
+				return
 			}
+			res.Write(pourSuccessMessage)
 		}
 	}
-	// GET requests only
-	/*if !found {
-	          res.WriteHeader(http.StatusNotFound)
-	          if _, err := res.Write([]byte(fmt.Sprint("404 no shot here\n"))); err != nil {
-	                  log.Panicln("Error when trying to write response")
-	          }
-	          return
-	  if found {
-	          // For POST requests to specific key, this should actually return 'link taken' or something
-	          if _, err := res.Write([]byte(contents)); err != nil {
-	                  log.Panicln("Error when trying to write response body")
-	          }
-	  } else {
-	          pour(key, r)
-	          if _, err := res.Write([]byte(fmt.Sprint("Contents stored in given link\n"))); err != nil {
-	                  log.Panicln("Error when trying to write response")
-	          }
-	  }*/
-	fmt.Printf("Request from client: %v\n", r.Header.Get("User-Agent"))
+	//fmt.Printf("Request from client: %v\n", r.Header.Get("User-Agent"))
 	return
 }
 
@@ -260,7 +297,7 @@ func KeyHandler(res http.ResponseWriter, r *http.Request) {
 func statDB(speak bool) (int, int, error) {
 	var numElements, numBytes int
 	err := db.View(func(tx *bbolt.Tx) error {
-		root := tx.Bucket([]byte(rootBucket))
+		root := tx.Bucket([]byte(dataBucketKey))
 		if root == nil {
 			return errors.New("Failed to open root bucket")
 		}
@@ -286,14 +323,15 @@ func statDB(speak bool) (int, int, error) {
 
 // *init* is a special function, hence the name of this one
 // https://tutorialedge.net/golang/the-go-init-function/
-func initialize(dbFile string, limit int, port int) error {
+func initialize(dbFile string, limitStorage, limitNums, port int, admKey string) error {
 	var err error // Because ':=' can't be used on the line below without declaring db as a new *local* variable, making the global one nil
 	db, err = bbolt.Open(dbFile, 0600, &bbolt.Options{Timeout: 1 * time.Second})
 	if err != nil {
 		return err
 	}
 	err = db.Update(func(tx *bbolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists([]byte(rootBucket))
+		_, err := tx.CreateBucketIfNotExists([]byte(dataBucketKey))
+		_, err = tx.CreateBucketIfNotExists([]byte(numsBucketKey))
 		return err
 	})
 	if err != nil {
@@ -303,9 +341,11 @@ func initialize(dbFile string, limit int, port int) error {
 	if err != nil {
 		return err
 	}
-	storageCTRL.bytesMax = 1000 * limit
+	storageCTRL.bytesMax = 1000 * limitStorage
 	storageCTRL.bytesUsed = numBytes
-	fmt.Printf("%v / %v KBs used\n", numBytes/1000, limit)
+	shotNumsLimit = limitNums
+	adminKey = admKey
+	fmt.Printf("%v / %v KBs used\n", numBytes/1000, limitStorage)
 	fmt.Println("Server started listening at port", port)
 	return nil
 }
@@ -315,9 +355,11 @@ func main() {
 	port := flag.Int("p", 8080, "Port")
 	dbFile := flag.String("d", "vodka.db", "Database file")
 	stat := flag.Bool("s", false, "View database keys and size of associated contents")
-	limit := flag.Int("l", 10000, "Storage limit in kilobytes (1000 bytes)")
+	storageLimit := flag.Int("l", 10000, "Storage limit in kilobytes (1000 bytes)")
+	numsLimit := flag.Int("n", 10, "Maximum number of shots per key")
+	admKey := flag.String("a", "vodkas", "Admin key to allow unlimited shots")
 	flag.Parse()
-	err := initialize(*dbFile, *limit, *port)
+	err := initialize(*dbFile, *storageLimit, *numsLimit, *port, *admKey)
 	defer db.Close()
 	if err != nil {
 		log.Fatal(err)
@@ -333,8 +375,8 @@ func main() {
 		return
 	}
 	router := mux.NewRouter()
-	router.HandleFunc("/", RootHandler)
-	router.HandleFunc("/{shotKey}", KeyHandler)
+	router.HandleFunc("/", rootHandler)
+	router.HandleFunc("/{shotKey}", keyHandler)
 	http.Handle("/", router)
 
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%v", *port), nil))
