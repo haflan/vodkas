@@ -1,4 +1,4 @@
-//  Seems to work: `go build -ldflags "-linkmode external -extldflags -static"`
+// Seems to work: `go build -ldflags "-linkmode external -extldflags -static"`
 package main
 
 import (
@@ -8,7 +8,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"mime/multipart"
 	"net/http"
@@ -144,7 +143,7 @@ func pour(shotKey string, r *http.Request) (err error) {
 		contents, numshots, err = extractMultipart(mpReader)
 	} else {
 		numshots = 1
-		contents, err = ioutil.ReadAll(r.Body)
+		contents, err = io.ReadAll(r.Body)
 	}
 	numshots = legalNumshots(numshots, r)
 	if err != nil {
@@ -188,7 +187,7 @@ func extractMultipart(mr *multipart.Reader) (contents []byte, num int, err error
 			log.Fatal(err)
 		}
 		if formName == FormNameText || formName == FormNameFile {
-			contents, err = ioutil.ReadAll(part)
+			contents, err = io.ReadAll(part)
 			if err != nil {
 				return
 			}
@@ -196,7 +195,7 @@ func extractMultipart(mr *multipart.Reader) (contents []byte, num int, err error
 		}
 		if formName == FormNameNumShots {
 			var numShotsRaw []byte
-			numShotsRaw, err = ioutil.ReadAll(part)
+			numShotsRaw, err = io.ReadAll(part)
 			if err != nil {
 				return
 			}
